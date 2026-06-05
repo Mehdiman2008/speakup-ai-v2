@@ -1,0 +1,17 @@
+{
+  "name": "SpeakUp AI",
+  "short_name": "SpeakUp",
+  "description": "Professional English speaking simulator and coach.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F4F1E9",
+  "theme_color": "#F4F1E9",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
