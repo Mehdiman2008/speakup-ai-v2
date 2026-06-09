@@ -1,7 +1,9 @@
-import type { ErrorEntry, SpeakingDNA } from "./types";
+import type { ErrorEntry, SpeakingDNA, SavedSession } from "./types";
 
 const KEY_ERRORS = "speakup:errorbank";
 const KEY_DNA = "speakup:dna";
+const KEY_SESSIONS = "speakup:sessions";
+const MAX_SESSIONS = 50;
 
 function read<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -25,6 +27,31 @@ export const loadErrors = () => read<ErrorEntry[]>(KEY_ERRORS, []);
 export const saveErrors = (e: ErrorEntry[]) => write(KEY_ERRORS, e);
 export const loadDna = () => read<SpeakingDNA | null>(KEY_DNA, null);
 export const saveDna = (d: SpeakingDNA | null) => write(KEY_DNA, d);
+
+/* ----- saved sessions (conversation history) ----- */
+export const loadSessions = () => read<SavedSession[]>(KEY_SESSIONS, []);
+
+// Overwrite the whole sessions list (used by cloud-sync merge).
+export const saveSessionsLocal = (list: SavedSession[]) => write(KEY_SESSIONS, list.slice(0, MAX_SESSIONS));
+
+export function saveSession(session: SavedSession): SavedSession[] {
+  const all = loadSessions();
+  // de-dupe by id (in case the same session is saved twice)
+  const filtered = all.filter((s) => s.id !== session.id);
+  const next = [session, ...filtered].slice(0, MAX_SESSIONS);
+  write(KEY_SESSIONS, next);
+  return next;
+}
+
+export function deleteSession(id: number): SavedSession[] {
+  const next = loadSessions().filter((s) => s.id !== id);
+  write(KEY_SESSIONS, next);
+  return next;
+}
+
+export function clearSessions() {
+  write(KEY_SESSIONS, []);
+}
 
 export function mergeDna(prev: SpeakingDNA | null, upd: Partial<SpeakingDNA>): SpeakingDNA {
   const cap = (arr: string[]) => Array.from(new Set(arr)).slice(0, 8);

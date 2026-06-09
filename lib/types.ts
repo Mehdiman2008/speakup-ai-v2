@@ -46,3 +46,13 @@ export interface SpeakingDNA {
   sessions: number;
   updated: string;
 }
+
+export interface SavedSession {
+  id: number;
+  date: string;        // human-readable
+  ts: number;          // sort key
+  mode: ModeId;
+  scenario: Scenario;
+  messages: ChatMessage[]; // includes hidden opener; UI filters it
+  durationSec: number;
+}
