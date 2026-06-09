@@ -265,6 +265,7 @@ export default function Page() {
 
     // Collect ALL error-bank blocks (auto-saved on /end, one per mistake)
     const ebMatches = Array.from(text.matchAll(/\[ERRORBANK\]([\s\S]*?)\[\/ERRORBANK\]/g));
+    
     if (ebMatches.length) {
       const newEntries: ErrorEntry[] = [];
       ebMatches.forEach((m, idx) => {
