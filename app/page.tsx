@@ -8,6 +8,11 @@ import {
   loadDna,
   saveDna,
   mergeDna,
+  loadSessions,
+  saveSession,
+  saveSessionsLocal,
+  deleteSession,
+  clearSessions,
 } from "@/lib/storage";
 import type {
   ChatMessage,
@@ -15,7 +20,10 @@ import type {
   ModeId,
   Scenario,
   SpeakingDNA,
+  SavedSession,
 } from "@/lib/types";
+import { getSupabase, supabaseEnabled } from "@/lib/supabaseClient";
+import { cloudLoad, cloudSave, mergeBundles, type CloudBundle } from "@/lib/cloudStore";
 
 /* ----------------------------- THEME --------------------------------------- */
 const C = {
@@ -55,7 +63,7 @@ function pickMime(): string | undefined {
 
 /* ============================== APP ======================================= */
 export default function Page() {
-  const [screen, setScreen] = useState<"home" | "chat" | "errorbank" | "dna">("home");
+  const [screen, setScreen] = useState<"home" | "chat" | "errorbank" | "dna" | "history">("home");
   const [mode, setMode] = useState<ModeId>("realistic");
   const [scenario, setScenario] = useState<Scenario>({
     description: "",
@@ -69,6 +77,8 @@ export default function Page() {
   const [ended, setEnded] = useState(false);
   const [errors, setErrors] = useState<ErrorEntry[]>([]);
   const [dna, setDna] = useState<SpeakingDNA | null>(null);
+  const [sessions, setSessions] = useState<SavedSession[]>([]);
+  const [viewing, setViewing] = useState<SavedSession | null>(null); // a past session opened read-only
   const [toast, setToast] = useState("");
   const [secs, setSecs] = useState(0);
 
@@ -84,6 +94,12 @@ export default function Page() {
   const [helpInput, setHelpInput] = useState("");
   const [helpLoading, setHelpLoading] = useState(false);
 
+  // auth / cloud sync
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const syncedRef = useRef(false);
+  const cloudTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const endRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mrRef = useRef<MediaRecorder | null>(null);
@@ -91,16 +107,75 @@ export default function Page() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const msgRef = useRef<ChatMessage[]>([]);
   msgRef.current = messages;
+  const sessionIdRef = useRef<number>(0);
+  const secsRef = useRef<number>(0);
+  secsRef.current = secs;
 
   useEffect(() => {
     setErrors(loadErrors());
     setDna(loadDna());
+    setSessions(loadSessions());
   }, []);
+
+  // Watch auth state; on sign-in, merge local data with the cloud once.
+  useEffect(() => {
+    const sb = getSupabase();
+    if (!sb) return;
+    sb.auth.getUser().then(({ data }) => {
+      if (data.user) {
+        setUserEmail(data.user.email || null);
+        syncOnLogin();
+      }
+    });
+    const { data: sub } = sb.auth.onAuthStateChange((_e, session) => {
+      const email = session?.user?.email || null;
+      setUserEmail(email);
+      if (email) {
+        syncedRef.current = false;
+        syncOnLogin();
+      }
+    });
+    return () => sub.subscription.unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function syncOnLogin() {
+    if (syncedRef.current) return;
+    syncedRef.current = true;
+    const cloud = await cloudLoad();
+    if (!cloud) return;
+    const local: CloudBundle = { sessions: loadSessions(), errors: loadErrors(), dna: loadDna() };
+    const merged = mergeBundles(local, cloud);
+    // reflect merged data locally + in state
+    setSessions(merged.sessions);
+    setErrors(merged.errors);
+    setDna(merged.dna);
+    saveSessionsLocal(merged.sessions);
+    saveErrors(merged.errors);
+    saveDna(merged.dna);
+    await cloudSave(merged);
+    flash("Synced across your devices ✓");
+  }
+
+  // Debounced push to cloud whenever data changes while signed in.
+  useEffect(() => {
+    if (!userEmail) return;
+    if (cloudTimer.current) clearTimeout(cloudTimer.current);
+    cloudTimer.current = setTimeout(() => {
+      cloudSave({ sessions, errors, dna });
+    }, 1200);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, errors, dna, userEmail]);
+
 
   useEffect(() => {
     const t = setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 60);
     return () => clearTimeout(t);
   }, [messages, loading, transcribing]);
+
+  useEffect(() => {
+    if (screen !== "history") setViewing(null);
+  }, [screen]);
 
   function flash(t: string) {
     setToast(t);
@@ -117,14 +192,36 @@ export default function Page() {
     setEnded(false);
     setSecs(0);
     setScreen("chat");
+    sessionIdRef.current = Date.now();
     if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = setInterval(() => setSecs((x) => x + 1), 1000);
     const opener = `Begin the roleplay now as ${scenario.aiRole}. Open with a realistic, specific concern or question based on this scenario: ${scenario.description || scenario.goal}. No introductions — just start the scene.`;
     runTurn([], opener, true);
   }
+
+  // Persist the current conversation to history (called on exit / end).
+  function persistSession() {
+    const msgs = msgRef.current;
+    // Only save if there's a real exchange (more than just the hidden opener).
+    const real = msgs.filter((m) => !m.hidden);
+    if (real.length < 2 || !sessionIdRef.current) return;
+    const session: SavedSession = {
+      id: sessionIdRef.current,
+      date: new Date().toLocaleString(),
+      ts: sessionIdRef.current,
+      mode,
+      scenario,
+      messages: msgs,
+      durationSec: secsRef.current,
+    };
+    const next = saveSession(session);
+    setSessions(next);
+  }
+
   function exitSession() {
     stopVoice();
     if (timerRef.current) clearInterval(timerRef.current);
+    persistSession();
     setScreen("home");
   }
 
@@ -145,8 +242,16 @@ export default function Page() {
         return;
       }
       const cleaned = processReply(data.reply || "");
-      setMessages((m) => [...m, { role: "assistant", content: cleaned }]);
+      setMessages((m) => {
+        const updated = [...m, { role: "assistant" as const, content: cleaned }];
+        msgRef.current = updated;
+        return updated;
+      });
       speakReply(cleaned);
+      // Auto-save the whole conversation to history when the session ends.
+      if (userText === "/end") {
+        setTimeout(persistSession, 0);
+      }
     } catch (e: any) {
       setMessages((m) => [...m, { role: "assistant", content: "[error] Couldn't reach the server: " + String(e?.message || e) }]);
     } finally {
@@ -159,9 +264,7 @@ export default function Page() {
     let text = reply;
 
     // Collect ALL error-bank blocks (auto-saved on /end, one per mistake)
-    const ebMatches = Array.from(
-  text.matchAll(/\[ERRORBANK\]([\s\S]*?)\[\/ERRORBANK\]/g)
-);
+    const ebMatches = [...text.matchAll(/\[ERRORBANK\]([\s\S]*?)\[\/ERRORBANK\]/g)];
     if (ebMatches.length) {
       const newEntries: ErrorEntry[] = [];
       ebMatches.forEach((m, idx) => {
@@ -354,6 +457,25 @@ export default function Page() {
     }
   }
 
+  /* ----- auth ----- */
+  async function sendMagicLink(email: string) {
+    const sb = getSupabase();
+    if (!sb) { flash("Sync isn't configured."); return; }
+    const { error } = await sb.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: typeof window !== "undefined" ? window.location.origin : undefined },
+    });
+    if (error) flash("⚠️ " + error.message);
+    else flash("Login link sent — check your email ✉️");
+  }
+  async function signOut() {
+    const sb = getSupabase();
+    if (sb) await sb.auth.signOut();
+    setUserEmail(null);
+    syncedRef.current = false;
+    flash("Signed out — data stays on this device.");
+  }
+
   /* ----- help panel (independent of roleplay) ----- */
   async function sendHelp(text?: string) {
     const t = (text ?? helpInput).trim();
@@ -421,16 +543,34 @@ export default function Page() {
               </span>
             </div>
           ) : (
-            <nav style={{ display: "flex", gap: 6 }}>
+            <nav style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <NavBtn active={screen === "history"} onClick={() => setScreen("history")}>
+                History{sessions.length ? ` ${sessions.length}` : ""}
+              </NavBtn>
               <NavBtn active={screen === "errorbank"} onClick={() => setScreen("errorbank")}>
                 Error Bank{errors.length ? ` ${errors.length}` : ""}
               </NavBtn>
               <NavBtn active={screen === "dna"} onClick={() => setScreen("dna")}>
                 Speaking DNA
               </NavBtn>
+              {supabaseEnabled() && (
+                userEmail ? (
+                  <NavBtn active={false} onClick={signOut}>
+                    ✓ {userEmail.split("@")[0]}
+                  </NavBtn>
+                ) : (
+                  <NavBtn active={false} onClick={() => setAuthOpen(true)}>
+                    ⇄ Sync
+                  </NavBtn>
+                )
+              )}
             </nav>
           )}
         </header>
+
+        {authOpen && !userEmail && (
+          <AuthModal onClose={() => setAuthOpen(false)} onSend={sendMagicLink} />
+        )}
 
         {screen === "home" && (
           <HomeScreen mode={mode} setMode={setMode} scenario={scenario} setScenario={setScenario} onStart={startSession} />
@@ -461,6 +601,19 @@ export default function Page() {
 
         {screen === "errorbank" && <ErrorBankScreen errors={errors} onClear={clearErrors} onBack={() => setScreen("home")} />}
         {screen === "dna" && <DnaScreen dna={dna} onClear={clearDna} onBack={() => setScreen("home")} />}
+        {screen === "history" && (
+          viewing ? (
+            <SessionViewer session={viewing} onBack={() => setViewing(null)} onSpeak={speakReply} ttsOn={ttsOn} />
+          ) : (
+            <HistoryScreen
+              sessions={sessions}
+              onOpen={(s) => setViewing(s)}
+              onDelete={(id) => setSessions(deleteSession(id))}
+              onClear={() => { clearSessions(); setSessions([]); }}
+              onBack={() => setScreen("home")}
+            />
+          )
+        )}
       </div>
 
       {helpOpen && screen === "chat" && (
@@ -479,6 +632,51 @@ export default function Page() {
           {toast}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ========================= AUTH MODAL ==================================== */
+function AuthModal({ onClose, onSend }: { onClose: () => void; onSend: (email: string) => void }) {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const valid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim());
+  return (
+    <div onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(20,18,14,0.45)", zIndex: 70, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{ background: C.card, borderRadius: 18, padding: 22, width: "min(380px, 94vw)", boxShadow: "0 18px 50px rgba(0,0,0,0.25)" }}>
+        <div style={{ fontFamily: "Fraunces, serif", fontSize: 20, fontWeight: 600, marginBottom: 4 }}>Sync across devices</div>
+        <p style={{ fontSize: 13, color: C.inkSoft, lineHeight: 1.6, marginTop: 0 }}>
+          ایمیلت رو وارد کن؛ یک لینک ورود برات می‌فرستیم. بعد از ورود، History و Error Bank و DNA بین گوشی و لپ‌تاپ sync می‌شوند.
+        </p>
+        {sent ? (
+          <div style={{ background: C.brandSoft, border: "1px solid #C6E3D6", borderRadius: 12, padding: "12px 14px", fontSize: 13.5, color: C.brand, lineHeight: 1.6 }}>
+            ✉️ لینک ورود به <b>{email}</b> ارسال شد. ایمیلت رو باز کن و روی لینک بزن — همین صفحه وارد می‌شود.
+          </div>
+        ) : (
+          <>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && valid) { onSend(email.trim()); setSent(true); } }}
+              placeholder="you@example.com"
+              style={{ ...inp, marginBottom: 10 }}
+            />
+            <button
+              onClick={() => { if (valid) { onSend(email.trim()); setSent(true); } }}
+              disabled={!valid}
+              style={{ width: "100%", background: valid ? C.brand : C.line, color: "#fff", border: "none", borderRadius: 11, padding: "12px", fontSize: 14.5, fontWeight: 600, cursor: valid ? "pointer" : "default" }}>
+              Send login link
+            </button>
+          </>
+        )}
+        <button onClick={onClose}
+          style={{ width: "100%", marginTop: 10, background: "none", border: "none", color: C.inkSoft, fontSize: 12.5, cursor: "pointer" }}>
+          {sent ? "Close" : "Cancel"}
+        </button>
+      </div>
     </div>
   );
 }
@@ -933,6 +1131,83 @@ function Markdown({ text }: { text: string }) {
   );
 }
 
+/* ========================== HISTORY ====================================== */
+function HistoryScreen({ sessions, onOpen, onDelete, onClear, onBack }: {
+  sessions: SavedSession[];
+  onOpen: (s: SavedSession) => void;
+  onDelete: (id: number) => void;
+  onClear: () => void;
+  onBack: () => void;
+}) {
+  function fmtDur(s: number) {
+    const m = Math.floor(s / 60);
+    return m > 0 ? `${m} min` : `${s}s`;
+  }
+  return (
+    <div>
+      <ScreenHead title="History" fa="جلسه‌های قبلی" onBack={onBack}>
+        {sessions.length > 0 && <button onClick={onClear} style={miniBtn}>Clear all</button>}
+      </ScreenHead>
+      {sessions.length === 0 ? (
+        <Empty>
+          No saved sessions yet. When you finish a session with <Code>End &amp; review</Code> (or leave it), the whole conversation is saved here so you can review it later.
+        </Empty>
+      ) : (
+        <div style={{ display: "grid", gap: 10 }}>
+          {sessions.map((s) => {
+            const meta = modeMeta(s.mode);
+            const turns = s.messages.filter((m) => !m.hidden).length;
+            return (
+              <div key={s.id} style={{ background: C.card, border: `1px solid ${C.line}`, borderRadius: 14, padding: 13, display: "flex", gap: 12, alignItems: "center" }}>
+                <span style={{ width: 5, alignSelf: "stretch", borderRadius: 4, background: meta.color }} />
+                <button onClick={() => onOpen(s)} style={{ flex: 1, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                    <span style={{ fontWeight: 600, fontSize: 14 }}>{s.scenario.myRole} vs {s.scenario.aiRole}</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: meta.color }}>{meta.label}</span>
+                  </div>
+                  <div style={{ fontSize: 12.5, color: C.inkSoft, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 380 }}>
+                    {s.scenario.goal || s.scenario.description || "—"}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.inkFaint, marginTop: 4 }}>{s.date} · {turns} messages · {fmtDur(s.durationSec)}</div>
+                </button>
+                <button onClick={() => onDelete(s.id)} title="Delete" style={{ background: "none", border: "none", cursor: "pointer", color: C.inkFaint, fontSize: 16, padding: "4px 6px" }}>🗑</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SessionViewer({ session, onBack, onSpeak, ttsOn }: {
+  session: SavedSession;
+  onBack: () => void;
+  onSpeak: (t: string) => void;
+  ttsOn: boolean;
+}) {
+  const meta = modeMeta(session.mode);
+  const visible = session.messages.filter((m) => !m.hidden);
+  return (
+    <div>
+      <ScreenHead title="Review" fa="مرور جلسه" onBack={onBack} />
+      <div style={{ background: C.card, border: `1px solid ${C.line}`, borderLeft: `3px solid ${meta.color}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontWeight: 600 }}>{session.scenario.myRole} vs {session.scenario.aiRole}</span>
+          <span style={{ fontSize: 11, fontWeight: 600, color: meta.color }}>{meta.label}</span>
+        </div>
+        {session.scenario.goal && <div style={{ fontSize: 13, color: C.inkSoft, marginTop: 3 }}>Goal: {session.scenario.goal}</div>}
+        <div style={{ fontSize: 11, color: C.inkFaint, marginTop: 4 }}>{session.date}</div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {visible.map((m, i) => (
+          <Bubble key={i} role={m.role} content={m.content} aiRole={session.scenario.aiRole} onSpeak={onSpeak} ttsOn={ttsOn} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ========================== ERROR BANK =================================== */
 function ErrorBankScreen({ errors, onClear, onBack }: { errors: ErrorEntry[]; onClear: () => void; onBack: () => void }) {
   return (
@@ -942,7 +1217,7 @@ function ErrorBankScreen({ errors, onClear, onBack }: { errors: ErrorEntry[]; on
       </ScreenHead>
       {errors.length === 0 ? (
         <Empty>
-          No saved mistakes yet. During a session, send <Code>/save</Code> to bank the latest one.
+          No saved mistakes yet. They&apos;re collected automatically when you finish a session with <Code>End &amp; review</Code>.
         </Empty>
       ) : (
         <div style={{ display: "grid", gap: 11 }}>
